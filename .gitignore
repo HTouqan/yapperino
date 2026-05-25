@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+build-portable/
+dist/
+dist-portable/
+*.spec
+*.egg-info/
+.venv/
+venv/
+.env
+.linkedin-review/

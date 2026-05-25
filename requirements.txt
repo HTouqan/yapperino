@@ -1,0 +1,9 @@
+faster-whisper
+sounddevice
+numpy
+pynput
+pyperclip
+pystray
+Pillow
+pycaw
+comtypes
