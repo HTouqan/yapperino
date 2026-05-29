@@ -34,11 +34,43 @@ from PIL import Image, ImageDraw, ImageTk
 
 # ---------- config ----------
 SAMPLE_RATE = 16000
-MODEL_NAME = "base.en"
 MIN_AUDIO_SECONDS = 0.3
 DOUBLE_TAP_WINDOW = 0.40
 HISTORY_CAP = 50
 HISTORY_PREVIEW_CHARS = 240   # display cap per row; full text still copied
+
+# Transcription quality tiers. All run locally on CPU (int8); no GPU needed.
+# Speed measured on a Ryzen 7 7800X3D as fraction of audio length (lower is
+# faster): small ~0.12x, medium ~0.39x, turbo ~0.30x, large-v3 ~0.69x.
+# Turbo is large-v3-class yet as quick as medium; large-v3 is the most
+# accurate base model but the slowest.
+QUALITY_TIERS = [
+    ("Fast (small)",         "small.en"),
+    ("Balanced (medium)",    "medium.en"),
+    ("High (turbo)",         "large-v3-turbo"),
+    ("Max (large-v3, slow)", "large-v3"),
+]
+DEFAULT_MODEL = "medium.en"
+_MODEL_BY_QUALITY = {lbl: m for lbl, m in QUALITY_TIERS}
+_QUALITY_BY_MODEL = {m: lbl for lbl, m in QUALITY_TIERS}
+
+# Coined service names Whisper can't know on its own. Biases decoding toward
+# these spellings instead of the nearest English word ("traffic" for Traefik,
+# "image" for immich). Editable in config.json -> "vocabulary".
+DEFAULT_VOCAB = ("Traefik, immich, smeepo, gluetun, MikroTik, qBittorrent, "
+                 "Sonarr, Radarr, Lidarr, Prowlarr, Bazarr, Proxmox, "
+                 "Cloudflare, Proton, Jellyfin, Navidrome")
+
+# Whisper's near-silence hallucinations (YouTube training artifacts). Dropped
+# only when one is the ENTIRE transcript, so normal dictation is never touched.
+HALLUCINATION_JUNK = {
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "like and subscribe",
+    "see you in the next video",
+    "subtitles by the amara.org community",
+}
 
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REG_APP_NAME = "Yapperino"
@@ -137,6 +169,9 @@ DEFAULTS = {
     "total_sessions": 0,
     "hotkey":         "ctrl_r",
     "history":        [],
+    "model":          DEFAULT_MODEL,
+    "vocabulary":     DEFAULT_VOCAB,
+    "beam_size":      5,
 }
 
 def load_config() -> dict:
@@ -160,6 +195,13 @@ HOTKEY           = parse_hotkey(cfg["hotkey"])
 if HOTKEY not in _LABEL_BY_KEY:
     HOTKEY = DEFAULT_HOTKEY
 history          = list(cfg["history"])[:HISTORY_CAP]
+model_name       = cfg["model"] or DEFAULT_MODEL
+vocabulary       = cfg["vocabulary"]
+try:
+    beam_size    = max(1, int(cfg["beam_size"]))
+except (TypeError, ValueError):
+    beam_size    = 5
+model_loading    = False
 
 def save_config() -> None:
     try:
@@ -172,13 +214,24 @@ def save_config() -> None:
                 "total_sessions": total_sessions,
                 "hotkey":         serialize_hotkey(HOTKEY),
                 "history":        history[:HISTORY_CAP],
+                "model":          model_name,
+                "vocabulary":     vocabulary,
+                "beam_size":      beam_size,
             }, f, indent=2)
     except Exception as e:
         log(f"config save failed: {e}")
 
 # ---------- model ----------
-log(f"loading model {MODEL_NAME}")
-model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+def _new_model(name: str) -> WhisperModel:
+    return WhisperModel(name, device="cpu", compute_type="int8")
+
+log(f"loading model {model_name}")
+try:
+    model = _new_model(model_name)
+except Exception as e:
+    log(f"model {model_name} load failed ({e}); falling back to small.en")
+    model_name = "small.en"
+    model = _new_model(model_name)
 log("model ready")
 
 # ---------- runtime state ----------
@@ -199,7 +252,7 @@ pill_win = pill_canvas = pill_dot = pill_text = None
 ctrl_status_canvas = ctrl_status_dot_id = None
 ctrl_status_lbl = ctrl_hint_lbl = ctrl_toggle_btn = None
 ctrl_mode_var = ctrl_startup_var = ctrl_sound_var = ctrl_mute_var = None
-ctrl_shortcut_var = ctrl_words_lbl = ctrl_copied_lbl = None
+ctrl_shortcut_var = ctrl_words_lbl = ctrl_copied_lbl = ctrl_quality_var = None
 history_inner = history_canvas = None
 tray: pystray.Icon | None = None
 
@@ -328,10 +381,11 @@ def init_control() -> None:
     global ctrl_status_canvas, ctrl_status_dot_id, ctrl_status_lbl, ctrl_hint_lbl
     global ctrl_toggle_btn, ctrl_mode_var, ctrl_startup_var, ctrl_sound_var
     global ctrl_mute_var, ctrl_words_lbl, ctrl_shortcut_var, ctrl_copied_lbl
+    global ctrl_quality_var
 
     tk_root.title("Yapperino")
     tk_root.configure(bg=COL_BG)
-    tk_root.geometry("400x680")
+    tk_root.geometry("400x720")
     tk_root.resizable(False, False)
     try:
         tk_root._icon_photo = ImageTk.PhotoImage(ICON_REC)
@@ -398,6 +452,23 @@ def init_control() -> None:
                        activebackground=COL_PANEL_HI, activeforeground=COL_TEXT,
                        borderwidth=0)
     opt.pack(side="left")
+
+    # quality chooser (bigger model = fewer mistakes, slightly slower)
+    q_frame = tk.Frame(tk_root, bg=COL_BG)
+    q_frame.pack(pady=(2, 8))
+    tk.Label(q_frame, text="Quality:", fg=COL_MUTED, bg=COL_BG,
+             font=("Segoe UI", 9)).pack(side="left", padx=(0, 8))
+    ctrl_quality_var = tk.StringVar(value=_QUALITY_BY_MODEL.get(model_name, model_name))
+    qopt = tk.OptionMenu(q_frame, ctrl_quality_var,
+                         *[lbl for lbl, _ in QUALITY_TIERS],
+                         command=_apply_quality)
+    qopt.config(bg=COL_PANEL, fg=COL_TEXT, activebackground=COL_PANEL_HI,
+                activeforeground=COL_TEXT, borderwidth=0, highlightthickness=0,
+                font=("Segoe UI", 9), cursor="hand2", width=20)
+    qopt["menu"].config(bg=COL_PANEL, fg=COL_TEXT,
+                        activebackground=COL_PANEL_HI, activeforeground=COL_TEXT,
+                        borderwidth=0)
+    qopt.pack(side="left")
 
     # checkboxes
     opts_frame = tk.Frame(tk_root, bg=COL_BG)
@@ -557,7 +628,11 @@ def hide_control() -> None:
 
 def _refresh_control() -> None:
     if ctrl_status_lbl is None: return
-    if paused:
+    if model_loading:
+        ctrl_status_canvas.itemconfig(ctrl_status_dot_id, fill=COL_BUSY)
+        ctrl_status_lbl.config(text="LOADING MODEL…", fg=COL_TEXT)
+        ctrl_toggle_btn.config(text="Pause")
+    elif paused:
         ctrl_status_canvas.itemconfig(ctrl_status_dot_id, fill=COL_IDLE)
         ctrl_status_lbl.config(text="PAUSED", fg=COL_MUTED)
         ctrl_toggle_btn.config(text="Resume")
@@ -619,6 +694,37 @@ def _apply_shortcut(label: str) -> None:
         stop_and_transcribe()
     log(f"shortcut={serialize_hotkey(HOTKEY)}")
     save_config()
+    if tk_root: tk_root.after(0, _refresh_control)
+
+def _apply_quality(label: str) -> None:
+    new_model = _MODEL_BY_QUALITY.get(label)
+    if not new_model or new_model == model_name:
+        return
+    threading.Thread(target=_reload_model, args=(new_model,), daemon=True).start()
+
+def _reload_model(new_model: str) -> None:
+    # Build the new model OUTSIDE busy_lock so dictation stays usable on the
+    # old one while it loads; swap under the lock only once it's ready.
+    global model, model_name, model_loading
+    model_loading = True
+    if tk_root: tk_root.after(0, _refresh_control)
+    log(f"loading model {new_model}")
+    try:
+        nm = _new_model(new_model)
+    except Exception as e:
+        log(f"model {new_model} load failed: {e}")
+        model_loading = False
+        if tk_root:
+            tk_root.after(0, lambda: ctrl_quality_var.set(
+                _QUALITY_BY_MODEL.get(model_name, model_name)))
+            tk_root.after(0, _refresh_control)
+        return
+    with busy_lock:
+        model = nm
+        model_name = new_model
+    model_loading = False
+    save_config()
+    log(f"model ready: {new_model}")
     if tk_root: tk_root.after(0, _refresh_control)
 
 # ---------- startup registry ----------
@@ -714,10 +820,22 @@ def _transcribe_and_paste(audio: np.ndarray) -> None:
     global total_words, history
     with busy_lock:
         try:
-            segments, _ = model.transcribe(audio, language="en",
-                                           beam_size=1, vad_filter=True)
+            # Use the full dynamic range; quiet mic input transcribes better.
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak > 0:
+                audio = (audio * (0.95 / peak)).astype(np.float32)
+            segments, _ = model.transcribe(
+                audio, language="en",
+                beam_size=beam_size,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                hotwords=(vocabulary or None),
+            )
             text = "".join(s.text for s in segments).strip()
             if not text: return
+            if text.lower().strip(" .!?") in HALLUCINATION_JUNK:
+                log(f"dropped hallucination: {text!r}")
+                return
             prev = None
             try: prev = pyperclip.paste()
             except Exception: pass
