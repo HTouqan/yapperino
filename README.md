@@ -103,3 +103,7 @@ Built on the work of:
 - [pystray](https://github.com/moses-palmer/pystray) (system tray)
 - [pycaw](https://github.com/AndreMiras/pycaw) (Windows audio control)
 - [sounddevice](https://github.com/spatialaudio/python-sounddevice), [Pillow](https://github.com/python-pillow/Pillow), [pyperclip](https://github.com/asweigart/pyperclip), [PyInstaller](https://github.com/pyinstaller/pyinstaller)
+
+## Author
+
+Hashem Touqan · [LinkedIn](https://www.linkedin.com/in/hashemtouqan/) · [github.com/HTouqan](https://github.com/HTouqan) for my other projects.
