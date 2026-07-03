@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 (2026-07-03)
+
+Tells you when the mic is off instead of failing silently.
+
+- If a recording comes back as pure silence (mic muted, a hardware mute switch, or the wrong input device selected), Yapperino now flashes "No sound. Mic muted?" on the pill and skips the transcription.
+- Before this, a muted mic looked like a bug: the pill flashed "Transcribing" and then nothing appeared, with no history entry and no reason given.
+- The app window title now shows the version so you can tell which build you are running.
+
 ## v0.2.0 (2026-05-29)
 
 Transcription accuracy upgrade. Still fully local, free, and offline.

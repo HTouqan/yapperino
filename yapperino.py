@@ -33,8 +33,13 @@ import pystray
 from PIL import Image, ImageDraw, ImageTk
 
 # ---------- config ----------
+__version__ = "0.3.0"
 SAMPLE_RATE = 16000
 MIN_AUDIO_SECONDS = 0.3
+# Below this peak amplitude the capture is effectively digital silence — the
+# mic is muted (hardware tap / OS privacy block) or the wrong device is default.
+# Warn instead of running a doomed transcription that returns nothing.
+SILENCE_PEAK = 0.004
 DOUBLE_TAP_WINDOW = 0.40
 HISTORY_CAP = 50
 HISTORY_PREVIEW_CHARS = 240   # display cap per row; full text still copied
@@ -370,6 +375,20 @@ def _refresh_pill() -> None:
     else:
         pill_win.withdraw()
 
+def flash_pill_warning(msg: str, ms: int = 2800) -> None:
+    """Briefly show a warning on the pill, then hide it (unless recording
+    resumed meanwhile). Used when a capture comes back silent."""
+    if pill_win is None: return
+    def _show():
+        pill_canvas.itemconfig(pill_dot, fill=COL_BUSY)
+        pill_canvas.itemconfig(pill_text, text=msg)
+        _position_pill(); pill_win.deiconify()
+        def _hide():
+            if state not in ("recording", "transcribing"):
+                pill_win.withdraw()
+        pill_win.after(ms, _hide)
+    if tk_root: tk_root.after(0, _show)
+
 # ---------- control window ----------
 def _hint_text() -> str:
     name = key_display(HOTKEY)
@@ -383,7 +402,7 @@ def init_control() -> None:
     global ctrl_mute_var, ctrl_words_lbl, ctrl_shortcut_var, ctrl_copied_lbl
     global ctrl_quality_var
 
-    tk_root.title("Yapperino")
+    tk_root.title(f"Yapperino v{__version__}")
     tk_root.configure(bg=COL_BG)
     tk_root.geometry("400x720")
     tk_root.resizable(False, False)
@@ -812,6 +831,12 @@ def stop_and_transcribe() -> None:
     audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
     if len(audio) < SAMPLE_RATE * MIN_AUDIO_SECONDS:
         set_state("idle"); return
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak < SILENCE_PEAK:
+        log(f"silent capture (peak={peak:.5f}); mic muted or wrong device")
+        set_state("idle")
+        flash_pill_warning("No sound. Mic muted?")
+        return
     set_state("transcribing")
     total_sessions += 1
     threading.Thread(target=_transcribe_and_paste, args=(audio,), daemon=True).start()
